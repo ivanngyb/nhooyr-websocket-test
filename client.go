@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -26,7 +28,7 @@ const (
 )
 
 type Client struct {
-	Id     int
+	Id     uint64
 	Idsent bool
 	hub    *Hub
 
@@ -37,7 +39,6 @@ type Client struct {
 	send chan []byte
 }
 
-var id = 0
 var (
 	newline = []byte{'\n'}
 	space   = []byte{' '}
@@ -49,8 +50,7 @@ func (c *Client) readPump() {
 		c.conn.Close(websocket.StatusNormalClosure, "")
 	}()
 	c.conn.SetReadLimit(maxMessageSize)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
+	ctx := context.Background()
 
 	for {
 		_, msg, err := c.conn.Read(ctx)
@@ -67,12 +67,11 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.hub.clientNum = removeClient(c.hub.clientNum, strconv.Itoa(c.Id))
+		c.hub.clientNum = removeClient(c.hub.clientNum, strconv.Itoa(int(c.Id)))
 		c.conn.Close(websocket.StatusNormalClosure, "")
 		log.Println("Client left: ", c.hub.clientNum)
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
+	ctx := context.Background()
 	for {
 		select {
 		case msg, ok := <-c.send:
@@ -84,7 +83,7 @@ func (c *Client) writePump() {
 				c.conn.Write(ctx, websocket.MessageBinary, msg)
 			} else if !c.Idsent {
 				var curPlayers = strings.Join(c.hub.clientNum, "_")
-				message := fmt.Sprintf("PlayerID_%s_%s", strconv.Itoa(c.Id), curPlayers)
+				message := fmt.Sprintf("PlayerID_%d_%s", int(c.Id), curPlayers)
 				c.conn.Write(ctx, websocket.MessageBinary, []byte(message))
 				c.Idsent = true
 			}
@@ -105,18 +104,28 @@ func removeClient(s []string, r string) []string {
 	return s
 }
 
+var id uint64
+
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	log.Println("New connection!")
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		log.Fatal("Error: ", err)
+		log.Println("Error: ", err)
+		return
 	}
 	client := &Client{hub: hub, conn: c, send: make(chan []byte, 256), Id: id}
 	client.hub.register <- client
 
-	client.hub.clientNum = append(client.hub.clientNum, strconv.Itoa(id))
+	client.hub.clientNum = append(client.hub.clientNum, strconv.Itoa(int(id)))
 
-	id += 1
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		atomic.AddUint64(&id, 1)
+		wg.Done()
+	}()
+
+	wg.Wait()
 
 	go client.readPump()
 	go client.writePump()
